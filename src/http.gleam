@@ -1,54 +1,51 @@
+import gleam/bit_array
+import gleam/bytes_builder
 import gleam/dict.{type Dict}
+import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
 import gleam/result
 import gleam/string
+import glisten.{Packet}
+import http/internal/http.{
+  type Request as InternalRequest, type Response as InternalResponse, Request,
+  Response,
+}
+import http/internal/utils.{merge_dicts}
+import http/router.{type Router as InternalRouter}
+
+pub type Request =
+  InternalRequest
+
+pub type Response =
+  InternalResponse
+
+pub type Router =
+  InternalRouter
 
 pub type ReadError {
   StopSequenceNotFound
-}
-
-pub type Request {
-  Request(
-    method: String,
-    path: String,
-    http_version: String,
-    headers: Dict(String, String),
-    body: Option(String),
-  )
-}
-
-pub type Response {
-  Response(
-    status: Int,
-    status_msg: String,
-    http_version: String,
-    body: Option(String),
-  )
 }
 
 type RequestLine {
   RequestLine(method: String, path: String, http_version: String)
 }
 
-pub type RouteHandler =
-  fn(Request) -> Response
-
-pub type Router {
-  Router(routes: Dict(String, RouteHandler))
+pub fn handle(
+  routes: Dict(String, router.RouteHandler),
+  route: String,
+  handler: router.RouteHandler,
+) {
+  dict.insert(routes, route, handler)
 }
 
-pub fn create_router() {
-  Router(routes: dict.new())
-}
-
-pub fn add_route(router: Router, route: String, handler: RouteHandler) {
-  let routes = router.routes
-  let routes = dict.insert(routes, route, handler)
-  Router(routes: routes)
-}
-
-pub fn handle_request(router: Router, route route: String, request req: Request) {
+fn handle_request(
+  router: router.Router,
+  route route: String,
+  request req: Request,
+) {
   case dict.get(router.routes, route) {
     Ok(handler) -> handler(req)
     Error(_) ->
@@ -70,10 +67,6 @@ fn get_http_status_msg(status: Int) -> String {
     500 -> "Internal Server Error"
     _ -> "Unknown"
   }
-}
-
-pub fn merge_dicts(dicts: List(Dict(String, String))) -> Dict(String, String) {
-  list.fold(dicts, dict.new(), fn(dict, acc) { dict.merge(acc, dict) })
 }
 
 fn read(str: String, stop: String) -> Result(#(String, String), ReadError) {
@@ -145,4 +138,46 @@ pub fn create_response(
     http_version: req.http_version,
     body: body,
   )
+}
+
+pub type AddRouteFn =
+  fn(String, router.RouteHandler) -> Nil
+
+pub type Server {
+  Server(router: Router)
+}
+
+pub fn serve(port port: Int, router router: Router) {
+  let assert Ok(_) =
+    glisten.handler(fn(_conn) { #(Nil, None) }, fn(msg, state, conn) {
+      let assert Packet(msg) = msg
+      let assert Ok(msg) = bit_array.to_string(msg)
+      let assert Ok(req) = parse_message(msg)
+      let res = handle_request(router, route: req.path, request: req)
+      let body = option.unwrap(res.body, "")
+      let body_size = string.byte_size(body)
+      let content_length_header = case body_size {
+        0 -> ""
+        _ -> "Content-Length: " <> int.to_string(body_size)
+      }
+      let response =
+        res.http_version
+        <> " "
+        <> int.to_string(res.status)
+        <> " "
+        <> res.status_msg
+        <> "\r\n"
+        // Headers go here
+        <> content_length_header
+        <> "\r\n"
+        <> "\r\n"
+        <> body
+        <> "\r\n\r\n"
+
+      let assert Ok(_) = glisten.send(conn, bytes_builder.from_string(response))
+      actor.continue(state)
+    })
+    |> glisten.serve(port)
+
+  process.sleep_forever()
 }
